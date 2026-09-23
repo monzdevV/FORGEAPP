@@ -20,18 +20,36 @@ export default function LoginPage() {
   async function handleGoogleSignIn() {
     setLoading(true)
     setError('')
+
+    // signInWithOAuth NO devuelve una sesión directamente.
+    // En su lugar, redirige el navegador al proveedor OAuth externo (Google).
+    // Google muestra su pantalla de consentimiento y, tras la autenticación,
+    // redirige al usuario a /auth/callback con un ?code= de un solo uso.
+    //   provider: 'google' → nombre del proveedor (debe estar habilitado en Supabase Dashboard
+    //             bajo Authentication → Providers → Google con Client ID y Secret)
+    //   redirectTo: URL a la que Google redirige tras autenticar — debe estar registrada en
+    //               "Redirect URLs" de Supabase y en "Authorized redirect URIs" de Google Cloud
+    // Devuelve: { data: { provider, url }, error }
+    //   Si no hay error, el navegador ya fue redirigido a Google — nada de lo que sigue se ejecuta.
     const { error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: { redirectTo: `${window.location.origin}/auth/callback` },
     })
     if (error) {
+      // Solo llegamos aquí si Supabase falla antes de poder redirigir (p.ej. proveedor deshabilitado)
       setError(error.message)
       setLoading(false)
     }
+    // Si no hay error, el navegador está navegando hacia Google — loading queda true intencionalmente
   }
 
   // ╔═ PO-006 ═╗ autentica al usuario con email/contraseña o crea una cuenta nueva
   // ╚═ linked → PO-007 components/layout/Sidebar.tsx
+  //
+  // DIFERENCIAS ENTRE LOS TRES MÉTODOS DE AUTENTICACIÓN:
+  //   signInWithOAuth     → delega la auth al proveedor externo; redirige el navegador; NO devuelve sesión aquí
+  //   signInWithPassword  → verifica credenciales existentes en Supabase Auth; devuelve sesión inmediata
+  //   signUp              → crea una cuenta nueva; puede requerir confirmación por email según la configuración
   async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
     setLoading(true)
@@ -39,6 +57,14 @@ export default function LoginPage() {
 
     try {
       if (mode === 'login') {
+        // signInWithPassword: verifica email + contraseña contra los usuarios de Supabase Auth.
+        // Parámetros: { email, password } — ambos obligatorios, enviados en el cuerpo de la petición.
+        // Devuelve: { data: { user, session }, error }
+        //   user:    objeto con id, email y metadatos del usuario autenticado
+        //   session: JWT de acceso + token de refresco; el cliente Supabase los escribe en cookies HTTP
+        //            automáticamente — no es necesario gestionarlos manualmente
+        //   error:   null si las credenciales son correctas, AuthError('Invalid login credentials')
+        //            si el email no existe o la contraseña es incorrecta
         const { error } = await supabase.auth.signInWithPassword({
           email,
           password,
@@ -49,8 +75,19 @@ export default function LoginPage() {
           return
         }
 
+        // Sesión ya establecida en cookies → el middleware de la raíz permitirá el acceso a rutas protegidas
         router.push('/overview')
       } else {
+        // signUp: crea una cuenta nueva en Supabase Auth con email y contraseña.
+        // Parámetros: { email, password } — los mismos que signInWithPassword.
+        // Devuelve: { data: { user, session }, error }
+        //   user:    objeto del usuario recién creado
+        //   session: disponible inmediatamente si "Email Confirmation" está DESHABILITADO en Supabase
+        //            (configuración de este proyecto). Si estuviera habilitado, session sería null y el
+        //            usuario recibiría un correo de verificación antes de poder acceder.
+        //   error:   null si se creó la cuenta, AuthError si el email ya está registrado
+        // NOTA: el perfil del usuario (tabla 'profiles') se crea mediante un trigger de BD en auth.users,
+        //   a diferencia de OAuth donde se crea en /auth/callback/route.ts con los metadatos del proveedor.
         const { error } = await supabase.auth.signUp({
           email,
           password,

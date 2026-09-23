@@ -2,198 +2,232 @@
  * GraficasClient.tsx — Visualizaciones de progreso del usuario con Chart.js.
  *
  * Chart.js se carga dinámicamente desde CDN (no como dependencia npm) para
- * reducir el bundle inicial de la app. El flag chartsLoaded controla cuándo
+ * reducir el bundle inicial de la app. El flag chartsReady controla cuándo
  * es seguro instanciar los gráficos.
  *
  * GRÁFICAS:
- *   1. Volumen por sesión (barras): evolución del volumen total kg por entreno
- *   2. Progresión de récord (línea): máximos históricos de un ejercicio seleccionado
+ *   1. Volumen por sesión (barras verticales): evolución del volumen total kg por entreno
+ *   2. Récord por ejercicio (barras horizontales): peso máximo histórico de cada ejercicio.
+ *      Un pico (barra) por ejercicio, ordenados de mayor a menor.
+ *      Los ejercicios de cardio muestran km en lugar de kg.
  *
  * Las instancias de Chart se guardan en refs para poder destruirlas antes de
  * redibujar (Chart.js no soporta múltiples instancias en el mismo canvas).
  *
- * STATS RESUMEN: 4 KPIs calculados desde los datos cargados en el servidor.
+ * STATS RESUMEN: 4 KPIs calculados desde los datos cargados en el servidor:
+ *   sesiones totales, volumen total (toneladas), series totales, tiempo total (minutos).
+ *
+ * Los datos llegan ya procesados del Server Component (graficas/page.tsx):
+ * workouts con sus ejercicios y series anidados.
  */
 'use client'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
-// Tipos locales que describen la forma de los datos recibidos del Server Component
+// ── Tipos de los datos recibidos del Server Component ────────────────────────
+
+interface SetRow {
+  weight: number | null
+  reps: number | null
+  is_completed: boolean
+}
+
+/**
+ * Fila de workout_exercise con ejercicio y series anidados.
+ * La relación FK workout_exercises → exercises es muchos-a-uno pero
+ * Supabase puede inferirla como array; se normaliza en exerciseMap.
+ */
+interface WERow {
+  exercise_id: string
+  exercises: { name: string; muscle_group: string }[] | { name: string; muscle_group: string } | null
+  workout_sets: SetRow[]
+}
+
 interface WorkoutRow {
   id: string
-  name: string
-  started_at: string
-  finished_at: string | null   // null si el entreno no fue completado (no debería llegarse aquí)
-  total_volume: number | null  // Suma de peso × reps de todas las series completadas
-  total_sets: number | null    // Número de series completadas en la sesión
-}
-interface ExerciseRow {
-  id: string
-  name: string
-  muscle_group: string
-}
-interface PRRow {
-  exercise_id: string
-  value: number                            // Valor del récord en kg
-  achieved_at: string | null               // Fecha en que se consiguió el récord
-  exercises: { name: string } | null       // Nombre del ejercicio via join — null si fue eliminado
+  finished_at: string
+  total_volume: number | null
+  total_sets: number | null
+  duration_seconds: number | null
+  workout_exercises: WERow[]
 }
 
-export default function GraficasClient({ workouts, exercises, prs }: {
-  workouts: WorkoutRow[]
-  exercises: ExerciseRow[]
-  prs: PRRow[]
-}) {
-  // Referencia al elemento <canvas> donde Chart.js dibujará la gráfica de volumen
-  const volChartRef = useRef<HTMLCanvasElement>(null)
-  // Referencia al elemento <canvas> donde Chart.js dibujará la gráfica de PRs
-  const prChartRef  = useRef<HTMLCanvasElement>(null)
+/** Tipo interno del constructor de Chart.js cargado desde CDN */
+type ChartInstance = { destroy: () => void }
+type ChartCtor     = new (...args: unknown[]) => ChartInstance
 
-  // ID del ejercicio seleccionado en el selector de la gráfica de PRs
-  // Se inicializa con el primer ejercicio del catálogo para tener datos visibles de inmediato
-  const [selectedEx, setSelectedEx] = useState(exercises[0]?.id || '')
+export default function GraficasClient({ workouts }: { workouts: WorkoutRow[] }) {
+  // Referencias a los elementos <canvas> donde Chart.js dibuja
+  const volCanvasRef = useRef<HTMLCanvasElement>(null)
+  const exCanvasRef  = useRef<HTMLCanvasElement>(null)
 
-  // Controla si Chart.js ya está disponible en window (se carga de forma asíncrona desde CDN)
-  const [chartsLoaded, setChartsLoaded] = useState(false)
+  // Instancias activas de Chart para poder destruirlas antes de redibujar
+  const volChart = useRef<ChartInstance | null>(null)
+  const exChart  = useRef<ChartInstance | null>(null)
 
-  // Guarda la instancia activa de la gráfica de volumen para poder destruirla antes de redibujar
-  const volChartInstance = useRef<unknown>(null)
-  // Guarda la instancia activa de la gráfica de PRs para poder destruirla antes de redibujar
-  const prChartInstance  = useRef<unknown>(null)
+  // Controla si Chart.js está disponible en window (se carga de forma asíncrona desde CDN)
+  const [chartsReady, setChartsReady] = useState(false)
 
   // ── Carga de Chart.js desde CDN al montar el componente ──
-  // Se añade como script al <head> para que esté disponible en window.Chart
   useEffect(() => {
-    const script = document.createElement('script')
-    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js'
+    const s = document.createElement('script')
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js'
     // Solo cuando el script ha cargado completamente se marca como disponible
-    script.onload = () => setChartsLoaded(true)
-    document.head.appendChild(script)
-  }, []) // Sin dependencias: solo se ejecuta al montar, una sola vez
+    s.onload = () => setChartsReady(true)
+    document.head.appendChild(s)
+  }, [])
 
-  // ── Gráfica de barras: volumen total por sesión ──
-  // Se redibuja cuando Chart.js carga o cuando cambian los datos de workouts
-  useEffect(() => {
-    if (!chartsLoaded) return  // Esperar a que Chart.js esté disponible en window
-    const Chart = (window as unknown as { Chart?: new (...args: unknown[]) => { destroy: () => void } }).Chart
-    if (!Chart) return
+  // ╔═ GE-012 ═╗ mapa de progresión por ejercicio — peso máximo por sesión
+  // ╚═ linked → GE-007 app/(app)/graficas/page.tsx
+  /**
+   * Construye un mapa exerciseId → { name, muscle, points[] } donde cada punto
+   * contiene la fecha de la sesión y el peso máximo levantado en ese día.
+   * Para cardio el campo weight almacena km.
+   * Se calcula con useMemo para no recalcular en cada re-render del componente.
+   */
+  const exerciseMap = useMemo(() => {
+    const m = new Map<string, { name: string; muscle: string; points: { date: string; maxWeight: number }[] }>()
+    for (const w of workouts) {
+      for (const we of (w.workout_exercises ?? [])) {
+        // Normaliza la relación exercises (puede llegar como array o como objeto)
+        const exInfo = Array.isArray(we.exercises) ? we.exercises[0] : we.exercises
+        if (!exInfo) continue
 
-    if (volChartRef.current) {
-      // Destruir instancia previa si existe — Chart.js lanza error si se intenta usar el mismo canvas dos veces
-      if (volChartInstance.current) (volChartInstance.current as { destroy: () => void }).destroy()
+        // Solo series marcadas como completadas con peso registrado
+        const done = (we.workout_sets ?? []).filter(s => s.is_completed && s.weight != null)
+        if (done.length === 0) continue
 
-      // Etiquetas del eje X: fecha corta en español (ej: "15 ene") de cada entrenamiento completado
-      const labels = workouts.map(w => w.finished_at
-        ? new Date(w.finished_at).toLocaleDateString('es-ES', { day: 'numeric', month: 'short' })
-        : '')  // String vacío si por alguna razón no hay fecha de finalización
-
-      // Datos del eje Y: volumen total de cada sesión en kg (0 si no se registró)
-      const data = workouts.map(w => Number(w.total_volume || 0))
-
-      // Crear instancia de gráfica de barras con paleta dorada del design system
-      volChartInstance.current = new Chart(volChartRef.current, {
-        type: 'bar',
-        data: {
-          labels,
-          datasets: [{
-            data,
-            backgroundColor: 'rgba(201,168,76,0.14)', // Dorado muy semitransparente para el relleno de barras
-            borderColor: '#C9A84C',                   // Borde dorado sólido (--gold del design system)
-            borderWidth: 1,
-            borderRadius: 2,                          // Esquinas ligeramente redondeadas para estética
-          }],
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false, // Permite que el canvas use la altura del contenedor padre
-          plugins: {
-            legend: { display: false }, // Sin leyenda: el título de la card ya identifica la gráfica
-          },
-          scales: {
-            // Eje X: líneas de cuadrícula sutiles en dorado, texto en color muted del design system
-            x: {
-              grid: { color: 'rgba(201,168,76,0.06)' },
-              ticks: { color: '#7A7570', font: { size: 10 } },
-            },
-            // Eje Y: misma configuración que X, sin sufijos de unidad (el título implica kg)
-            y: {
-              grid: { color: 'rgba(201,168,76,0.06)' },
-              ticks: { color: '#7A7570', font: { size: 10 } },
-            },
-          },
-        },
-      })
+        const maxW = Math.max(...done.map(s => s.weight!))
+        if (!m.has(we.exercise_id)) {
+          m.set(we.exercise_id, { name: exInfo.name, muscle: exInfo.muscle_group, points: [] })
+        }
+        m.get(we.exercise_id)!.points.push({
+          date: new Date(w.finished_at).toLocaleDateString('es-ES', { day: 'numeric', month: 'short' }),
+          maxWeight: maxW,
+        })
+      }
     }
-  }, [chartsLoaded, workouts]) // Se redibuja si los workouts cambian (ej: se completa un nuevo entreno)
+    return m
+  }, [workouts])
 
-  // ── Gráfica de línea: progresión del récord personal por ejercicio ──
-  // Se redibuja cuando cambia el ejercicio seleccionado, los PRs, o cuando Chart.js carga
+  /**
+   * Pico histórico por ejercicio: toma el máximo absoluto de todos los puntos
+   * y ordena de mayor a menor. Se limita a 15 ejercicios para que la gráfica
+   * horizontal sea legible.
+   * Los ejercicios de cardio muestran km; el resto muestran kg.
+   */
+  const exercisePeaks = useMemo(() =>
+    Array.from(exerciseMap.entries())
+      .map(([id, d]) => ({
+        id,
+        name: d.name,
+        muscle: d.muscle,
+        peak: Math.max(...d.points.map(p => p.maxWeight)),
+        isCardio: d.muscle === 'cardio',
+      }))
+      .sort((a, b) => b.peak - a.peak)
+      .slice(0, 15),
+    [exerciseMap])
+
+  // ── Gráfica 1: volumen total por sesión (barras verticales) ──
+  // Se redibuja cuando Chart.js carga o cambian los workouts
   useEffect(() => {
-    if (!chartsLoaded || !selectedEx) return // Necesita Chart.js cargado y un ejercicio válido seleccionado
-    const Chart = (window as unknown as { Chart?: new (...args: unknown[]) => { destroy: () => void } }).Chart
+    if (!chartsReady || !volCanvasRef.current) return
+    const Chart = (window as unknown as { Chart?: ChartCtor }).Chart
     if (!Chart) return
 
-    if (prChartRef.current) {
-      // Destruir instancia previa para evitar error de canvas duplicado
-      if (prChartInstance.current) (prChartInstance.current as { destroy: () => void }).destroy()
+    // Destruir instancia previa — Chart.js lanza error si el canvas ya tiene una instancia
+    volChart.current?.destroy()
 
-      // Filtrar PRs del ejercicio seleccionado — ya llegan en orden cronológico desde el servidor
-      const exPrs = prs.filter(p => p.exercise_id === selectedEx)
+    // Etiquetas del eje X: fecha corta de cada sesión completada
+    const labels = workouts.map(w =>
+      new Date(w.finished_at).toLocaleDateString('es-ES', { day: 'numeric', month: 'short' }))
 
-      // Etiquetas del eje X: fecha corta de cada récord personal conseguido
-      const labels = exPrs.map(p => p.achieved_at
-        ? new Date(p.achieved_at).toLocaleDateString('es-ES', { day: 'numeric', month: 'short' })
-        : '')
+    // Datos del eje Y: volumen total de cada sesión en kg
+    const data = workouts.map(w => Number(w.total_volume || 0))
 
-      // Datos del eje Y: valor del récord en kg en cada punto temporal
-      const data = exPrs.map(p => p.value)
+    volChart.current = new Chart(volCanvasRef.current, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          data,
+          backgroundColor: 'rgba(201,168,76,0.14)',
+          borderColor: '#C9A84C',
+          borderWidth: 1,
+          borderRadius: 2,
+        }],
+      },
+      options: buildChartOptions(),
+    } as unknown as [])
+  }, [chartsReady, workouts])
 
-      // Crear instancia de gráfica de línea con área rellena bajo la curva
-      prChartInstance.current = new Chart(prChartRef.current, {
-        type: 'line',
-        data: {
-          labels,
-          datasets: [{
-            data,
-            borderColor: '#C9A84C',                      // Línea principal en dorado
-            borderWidth: 2,
-            backgroundColor: 'rgba(201,168,76,0.05)',    // Área bajo la curva muy sutil
-            fill: true,                                  // Rellenar el área bajo la línea
-            tension: 0.4,                                // Suavizar la curva (0=recto, 1=muy curvo)
-            pointBackgroundColor: '#C9A84C',             // Puntos de datos en dorado sólido
-            pointRadius: 4,                              // Tamaño visible de los puntos en el gráfico
-          }],
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          plugins: {
-            legend: { display: false },
-          },
-          scales: {
-            x: {
-              grid: { color: 'rgba(201,168,76,0.06)' },
-              ticks: { color: '#7A7570', font: { size: 10 } },
-            },
-            y: {
-              grid: { color: 'rgba(201,168,76,0.06)' },
-              ticks: {
-                color: '#7A7570',
-                font: { size: 10 },
-                // Añadir sufijo ' kg' a cada valor del eje Y para indicar la unidad
-                callback: (v: unknown) => v + ' kg',
+  // ── Gráfica 2: pico histórico por ejercicio (barras horizontales) ──
+  // Una barra por ejercicio — el eje Y son los nombres, el eje X es el peso máximo.
+  // Se redibuja cuando cambian los picos calculados o cuando Chart.js carga.
+  useEffect(() => {
+    if (!chartsReady || !exCanvasRef.current) return
+    const Chart = (window as unknown as { Chart?: ChartCtor }).Chart
+    if (!Chart) return
+
+    // Destruir instancia previa antes de redibujar
+    exChart.current?.destroy()
+    exChart.current = null
+
+    if (exercisePeaks.length === 0) return
+
+    exChart.current = new Chart(exCanvasRef.current, {
+      type: 'bar',
+      data: {
+        labels: exercisePeaks.map(e => e.name),
+        datasets: [{
+          data: exercisePeaks.map(e => e.peak),
+          // Cardio en azul, fuerza en dorado — distinción visual de unidades (km vs kg)
+          backgroundColor: exercisePeaks.map(e =>
+            e.isCardio ? 'rgba(59,130,246,0.2)' : 'rgba(201,168,76,0.2)'),
+          borderColor: exercisePeaks.map(e =>
+            e.isCardio ? '#3B82F6' : '#C9A84C'),
+          borderWidth: 1,
+          borderRadius: 3,
+        }],
+      },
+      options: {
+        // indexAxis 'y' convierte las barras verticales en horizontales
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              // Muestra la unidad correcta según el tipo de ejercicio
+              label: (ctx: unknown) => {
+                const item = exercisePeaks[(ctx as { dataIndex: number }).dataIndex]
+                const unit = item.isCardio ? 'km' : 'kg'
+                return ` ${(ctx as { raw: number }).raw} ${unit}`
               },
             },
           },
         },
-      })
-    }
-  }, [chartsLoaded, selectedEx, prs]) // Se redibuja al cambiar ejercicio seleccionado o al llegar nuevos PRs
+        scales: {
+          x: { grid: { color: 'rgba(201,168,76,0.06)' }, ticks: { color: '#7A7570', font: { size: 10 } } },
+          y: { grid: { color: 'rgba(201,168,76,0.06)' }, ticks: { color: '#7A7570', font: { size: 11 } } },
+        },
+      },
+    } as unknown as [])
+  }, [chartsReady, exercisePeaks])
+
+  // ── KPIs: calculados en cliente desde los datos ya cargados ──
+  const totalVolume = workouts.reduce((s, w) => s + Number(w.total_volume || 0), 0)
+  const totalSets   = workouts.reduce((s, w) => s + Number(w.total_sets || 0), 0)
+  const totalMins   = Math.round(workouts.reduce((s, w) => s + Number(w.duration_seconds || 0), 0) / 60)
+
+  // Altura dinámica de la gráfica de ejercicios según número de barras (min 200, max ~420 px)
+  const exChartHeight = Math.max(200, exercisePeaks.length * 28)
 
   return (
-    // Animación de entrada de página definida como @keyframes panelIn en globals.css
     <div style={{ padding: '22px', animation: 'panelIn 0.35s cubic-bezier(0.16,1,0.3,1) both' }}>
 
-      {/* ── Sección superior: las dos gráficas en grid de dos columnas ── */}
+      {/* ── Las dos gráficas en grid de dos columnas ── */}
       <div className="g2" style={{ marginBottom: '14px' }}>
 
         {/* Gráfica de barras: volumen total por sesión de entrenamiento */}
@@ -201,91 +235,87 @@ export default function GraficasClient({ workouts, exercises, prs }: {
           <div className="card-hd">
             <div className="card-title">Volumen por sesión</div>
           </div>
-          {/* Estado vacío: se muestra cuando no hay entrenamientos completados todavía */}
+          {/* Estado vacío: no hay entrenamientos completados todavía */}
           {workouts.length === 0 ? (
             <div style={{ fontSize: '12px', color: 'var(--txt2)', padding: '20px 0' }}>
-              Completa entrenamientos para ver datos aquí.
+              Completa entrenamientos para ver datos.
             </div>
           ) : (
-            // Contenedor con altura fija: Chart.js necesita un padre con altura definida cuando maintainAspectRatio=false
             <div style={{ height: '200px' }}>
-              <canvas ref={volChartRef} />
+              <canvas ref={volCanvasRef} />
             </div>
           )}
         </div>
 
-        {/* Gráfica de línea: progresión del récord personal por ejercicio */}
+        {/* Gráfica horizontal: récord (pico) por ejercicio
+            Un pico por ejercicio, ordenados de mayor a menor.
+            Dorado = fuerza (kg) · Azul = cardio (km) */}
         <div className="card">
           <div className="card-hd">
-            <div className="card-title">Progresión de récord</div>
-            {/* Selector de ejercicio: permite cambiar qué récord se visualiza en la gráfica */}
-            <select
-              value={selectedEx}
-              onChange={e => setSelectedEx(e.target.value)}
-              style={{
-                background: 'var(--s2)',             // Fondo de superficie para integrarse con el card
-                border: '0.5px solid var(--bdr2)',   // Borde sutil en dorado semitransparente
-                color: 'var(--txt)',
-                padding: '4px 8px',
-                fontSize: '11px',
-                outline: 'none',                     // Eliminar el outline nativo del navegador
-              }}
-            >
-              {/* Renderizar una opción por cada ejercicio del catálogo */}
-              {exercises.map(ex => <option key={ex.id} value={ex.id}>{ex.name}</option>)}
-            </select>
+            <div className="card-title">Récord por ejercicio</div>
           </div>
-
-          {/* Estado vacío: el ejercicio seleccionado no tiene PRs registrados todavía */}
-          {prs.filter(p => p.exercise_id === selectedEx).length === 0 ? (
+          {exercisePeaks.length === 0 ? (
             <div style={{ fontSize: '12px', color: 'var(--txt2)', padding: '20px 0' }}>
-              Sin récords para este ejercicio.
+              Completa entrenamientos para ver datos.
             </div>
           ) : (
-            <div style={{ height: '200px' }}>
-              <canvas ref={prChartRef} />
+            // Altura adaptada al número de ejercicios para que todas las barras sean legibles
+            <div style={{ height: `${exChartHeight}px` }}>
+              <canvas ref={exCanvasRef} />
             </div>
           )}
         </div>
       </div>
 
-      {/* ── KPIs de resumen: estadísticas globales calculadas en cliente ── */}
-      {/* Los valores se calculan en cliente a partir de los datos ya cargados; no hay queries adicionales */}
+      {/* ── KPIs de resumen ── */}
       <div className="g4">
 
-        {/* Total de sesiones de entrenamiento completadas históricamente */}
+        {/* Total de sesiones completadas históricamente */}
         <div className="kpi">
           <div className="kpi-lbl">Sesiones totales</div>
           <div className="kpi-val c-gold">{workouts.length}</div>
           <div className="kpi-sub c-muted">completadas</div>
         </div>
 
-        {/* Volumen total histórico, convertido de kg a toneladas para mejor legibilidad con valores grandes */}
+        {/* Volumen total histórico en toneladas */}
         <div className="kpi">
           <div className="kpi-lbl">Volumen total</div>
           <div className="kpi-val">
-            {/* Dividir entre 1000 para convertir a toneladas; Math.round elimina decimales */}
-            {Math.round(workouts.reduce((s, w) => s + Number(w.total_volume || 0), 0) / 1000).toLocaleString()}
+            {Math.round(totalVolume / 1000).toLocaleString()}
           </div>
           <div className="kpi-sub c-muted">toneladas</div>
         </div>
 
-        {/* Total de series completadas en todas las sesiones históricas */}
+        {/* Total de series completadas en todas las sesiones */}
         <div className="kpi">
           <div className="kpi-lbl">Series totales</div>
-          <div className="kpi-val">
-            {workouts.reduce((s, w) => s + Number(w.total_sets || 0), 0)}
-          </div>
+          <div className="kpi-val">{totalSets}</div>
           <div className="kpi-sub c-muted">completadas</div>
         </div>
 
-        {/* Número de récords personales logrados — cada fila en la tabla personal_records es un récord */}
+        {/* Tiempo total de entrenamiento en minutos */}
         <div className="kpi">
-          <div className="kpi-lbl">PRs logrados</div>
-          <div className="kpi-val c-gold">{prs.length}</div>
-          <div className="kpi-sub c-muted">récords personales</div>
+          <div className="kpi-lbl">Tiempo total</div>
+          <div className="kpi-val">{totalMins.toLocaleString()}</div>
+          <div className="kpi-sub c-muted">minutos</div>
         </div>
       </div>
     </div>
   )
+}
+
+/**
+ * Opciones base de Chart.js compartidas por ambas gráficas (escalas, grid, tipografía).
+ * Se exporta como función para evitar referencias circulares al mutar el objeto.
+ */
+function buildChartOptions() {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { grid: { color: 'rgba(201,168,76,0.06)' }, ticks: { color: '#7A7570', font: { size: 10 } } },
+      y: { grid: { color: 'rgba(201,168,76,0.06)' }, ticks: { color: '#7A7570', font: { size: 10 } } },
+    },
+  }
 }
