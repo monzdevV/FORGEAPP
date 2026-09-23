@@ -6,3 +6,6 @@ out/
 build/
 *.tsbuildinfo
 .vercel
+
+# Claude Code local settings (contiene tokens)
+.claude/settings.local.json
